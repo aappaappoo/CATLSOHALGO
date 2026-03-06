@@ -120,9 +120,9 @@ def transfer_test_orders(
 ) -> tuple:
     """Move a stratified subset of test orders into the training set.
 
-    Orders are sorted by their label (y_t) and every other order is selected
-    for transfer, giving both the augmented training set and the remaining
-    test set good coverage of the full SOH range.
+    The min/max label orders are **always** transferred so that the model
+    never needs to extrapolate.  The remaining budget is filled by picking
+    every-other order (sorted by label) for broad, uniform coverage.
 
     When *exclude_original* is ``True`` the returned training set contains
     **only** the transferred rows (useful when the original and test data
@@ -138,10 +138,29 @@ def transfer_test_orders(
         .reset_index()
     )
 
-    n_transfer = max(1, int(len(order_info) * ratio))
-    # Pick every-other order for transfer (stratified coverage)
-    transfer_idx = list(range(0, len(order_info), 2))[:n_transfer]
-    remain_idx = [i for i in range(len(order_info)) if i not in transfer_idx]
+    n_total = len(order_info)
+    n_transfer = max(1, int(n_total * ratio))
+
+    # Always include the extreme orders (min and max label) so the model
+    # never has to extrapolate beyond training range.
+    must_transfer = {0, n_total - 1}
+    # Also include the second-extreme on each end if available, to provide
+    # redundancy at the boundaries.
+    if n_total > 3:
+        must_transfer.add(1)
+        must_transfer.add(n_total - 2)
+
+    # Fill remaining budget with every-other order from the middle
+    middle_pool = [i for i in range(n_total) if i not in must_transfer]
+    remaining_budget = max(0, n_transfer - len(must_transfer))
+    # Pick every other from sorted middle for even coverage
+    extra = middle_pool[::2][:remaining_budget]
+    if len(extra) < remaining_budget:
+        still_left = [i for i in middle_pool if i not in extra]
+        extra += still_left[:remaining_budget - len(extra)]
+
+    transfer_idx = sorted(must_transfer | set(extra))
+    remain_idx = [i for i in range(n_total) if i not in transfer_idx]
 
     transfer_ids = order_info.iloc[transfer_idx]["order_id"].tolist()
     remain_ids = order_info.iloc[remain_idx]["order_id"].tolist()
