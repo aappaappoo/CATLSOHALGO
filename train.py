@@ -190,10 +190,21 @@ def transfer_test_orders(
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_pca_components(X, max_components=50):
+    """Return the number of PCA components that is safe for *X*."""
+    return min(max_components, X.shape[1], X.shape[0])
+
+
+# ---------------------------------------------------------------------------
 # Optuna helpers
 # ---------------------------------------------------------------------------
 
 def _lgb_objective(trial, X_tr, y_tr, X_val, y_val):
+    # Cap min_child_samples at 25 % of training rows so that leaf nodes
+    # always have enough data to split in small-sample regimes.
     max_mcs = max(2, min(100, len(X_tr) // 4))
     params = {
         "n_estimators": trial.suggest_int("n_estimators", 200, 2000),
@@ -217,6 +228,8 @@ def _mlp_objective(trial, X_tr, y_tr, X_val, y_val):
     layers = tuple(trial.suggest_int(f"l{i}", 32, 256) for i in range(n_layers))
     alpha = trial.suggest_float("alpha", 0.01, 10.0, log=True)
     lr = trial.suggest_float("lr", 1e-4, 0.01, log=True)
+    # Need at least ~20 samples so the 15 % validation split yields ≥ 3
+    # samples – otherwise early stopping is unreliable.
     use_early_stop = len(X_tr) >= 20
     m = MLPRegressor(
         hidden_layer_sizes=layers, max_iter=3000, alpha=alpha,
@@ -323,7 +336,7 @@ def main():
     X_ord_val_s = ord_scaler.transform(X_ord_val)
 
     # optional PCA on order-level features
-    n_pca = min(50, X_ord_tr_s.shape[1], X_ord_tr_s.shape[0])
+    n_pca = _safe_pca_components(X_ord_tr_s)
     pca = PCA(n_components=n_pca, random_state=args.seed)
     X_ord_tr_pca = pca.fit_transform(X_ord_tr_s)
     X_ord_val_pca = pca.transform(X_ord_val_s)
@@ -357,12 +370,11 @@ def main():
     # Retrain on full data
     full_ord_scaler = StandardScaler()
     X_ord_all_s = full_ord_scaler.fit_transform(X_ord)
-    n_pca_full = min(50, X_ord_all_s.shape[1], X_ord_all_s.shape[0])
-    full_pca = PCA(n_components=n_pca_full,
+    full_pca = PCA(n_components=_safe_pca_components(X_ord_all_s),
                    random_state=args.seed)
     X_ord_all_pca = full_pca.fit_transform(X_ord_all_s)
 
-    # For small datasets, disable early_stopping (needs validation split)
+    # Need ≥ 20 samples so the 15 % validation split yields ≥ 3 samples.
     use_early_stop = len(y_ord) >= 20
     mlp_model = MLPRegressor(
         hidden_layer_sizes=layers, max_iter=3000, alpha=best_alpha,
