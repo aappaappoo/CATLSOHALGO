@@ -2,12 +2,23 @@
 """
 Train a regression model to predict battery SOH.
 
+Supports transferring a stratified subset of test orders into the training
+set so that the model sees the full SOH range present in both datasets.
+
 Usage:
     python train.py --train_path input/训练集_特征_标签.csv \
                     --test_path input/测试集_特征_标签.csv \
                     --mapping_path input/window_range_maping.json \
-                    --output_dir output \
+                    --output_dir ./ \
                     --n_trials 50
+
+With data transfer (recommended when train/test distributions differ):
+    python train.py --train_path input/训练集_特征_标签.csv \
+                    --test_path input/测试集_特征_标签.csv \
+                    --mapping_path input/window_range_maping.json \
+                    --output_dir ./ \
+                    --n_trials 50 \
+                    --transfer_ratio 0.5
 """
 
 import argparse
@@ -97,16 +108,80 @@ def build_order_features(
 
 
 # ---------------------------------------------------------------------------
+# Data transfer helpers
+# ---------------------------------------------------------------------------
+
+def transfer_test_orders(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    ratio: float = 0.5,
+    seed: int = 42,
+    exclude_original: bool = False,
+) -> tuple:
+    """Move a stratified subset of test orders into the training set.
+
+    Orders are sorted by their label (y_t) and every other order is selected
+    for transfer, giving both the augmented training set and the remaining
+    test set good coverage of the full SOH range.
+
+    When *exclude_original* is ``True`` the returned training set contains
+    **only** the transferred rows (useful when the original and test data
+    come from completely different battery types / distributions).
+
+    Returns (augmented_train_df, remaining_test_df, transfer_ids, remain_ids).
+    """
+    label_col = "soh" if "soh" in test_df.columns else "y_t"
+    order_info = (
+        test_df.groupby("order_id")[label_col]
+        .first()
+        .sort_values()
+        .reset_index()
+    )
+
+    n_transfer = max(1, int(len(order_info) * ratio))
+    # Pick every-other order for transfer (stratified coverage)
+    transfer_idx = list(range(0, len(order_info), 2))[:n_transfer]
+    remain_idx = [i for i in range(len(order_info)) if i not in transfer_idx]
+
+    transfer_ids = order_info.iloc[transfer_idx]["order_id"].tolist()
+    remain_ids = order_info.iloc[remain_idx]["order_id"].tolist()
+
+    transfer_rows = test_df[test_df["order_id"].isin(transfer_ids)].copy()
+    remain_rows = test_df[test_df["order_id"].isin(remain_ids)].copy()
+
+    # Normalise label column to "soh" for training
+    if label_col != "soh":
+        transfer_rows = transfer_rows.rename(columns={label_col: "soh"})
+
+    if exclude_original:
+        augmented = transfer_rows.reset_index(drop=True)
+    else:
+        # Oversample transferred rows so they constitute ~30 % of training
+        # data, preventing the original data from drowning out the signal.
+        target_frac = 0.30
+        n_orig = len(train_df)
+        n_target = int(n_orig * target_frac / (1 - target_frac))
+        repeat_factor = max(1, n_target // max(1, len(transfer_rows)))
+        oversampled = pd.concat(
+            [transfer_rows] * repeat_factor, ignore_index=True,
+        )
+        augmented = pd.concat([train_df, oversampled], ignore_index=True)
+
+    return augmented, remain_rows, transfer_ids, remain_ids
+
+
+# ---------------------------------------------------------------------------
 # Optuna helpers
 # ---------------------------------------------------------------------------
 
 def _lgb_objective(trial, X_tr, y_tr, X_val, y_val):
+    max_mcs = max(2, min(100, len(X_tr) // 4))
     params = {
         "n_estimators": trial.suggest_int("n_estimators", 200, 2000),
         "learning_rate": trial.suggest_float("lr", 0.005, 0.3, log=True),
         "max_depth": trial.suggest_int("max_depth", 3, 12),
         "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-        "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+        "min_child_samples": trial.suggest_int("min_child_samples", 2, max_mcs),
         "subsample": trial.suggest_float("subsample", 0.5, 1.0),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
         "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
@@ -123,10 +198,13 @@ def _mlp_objective(trial, X_tr, y_tr, X_val, y_val):
     layers = tuple(trial.suggest_int(f"l{i}", 32, 256) for i in range(n_layers))
     alpha = trial.suggest_float("alpha", 0.01, 10.0, log=True)
     lr = trial.suggest_float("lr", 1e-4, 0.01, log=True)
+    use_early_stop = len(X_tr) >= 20
     m = MLPRegressor(
         hidden_layer_sizes=layers, max_iter=3000, alpha=alpha,
         learning_rate_init=lr, learning_rate="adaptive", random_state=42,
-        early_stopping=True, validation_fraction=0.15, n_iter_no_change=30,
+        early_stopping=use_early_stop,
+        validation_fraction=0.15 if use_early_stop else 0.0,
+        n_iter_no_change=30 if use_early_stop else 10,
     )
     m.fit(X_tr, y_tr)
     return mean_absolute_error(y_val, m.predict(X_val))
@@ -152,6 +230,15 @@ def main():
     parser.add_argument("--output_dir", default="output")
     parser.add_argument("--n_trials", type=int, default=50,
                         help="Optuna trials per model type")
+    parser.add_argument("--transfer_ratio", type=float, default=0.0,
+                        help="Fraction of test orders to transfer into "
+                             "training (0.0 = none, 0.5 = ~half). Use when "
+                             "train/test distributions differ significantly.")
+    parser.add_argument("--exclude_original", action="store_true",
+                        help="When set, discard the original training data "
+                             "and train *only* on the transferred test "
+                             "orders. Use when the original and test data "
+                             "come from entirely different battery types.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -159,7 +246,7 @@ def main():
     np.random.seed(args.seed)
 
     # ---- load -------------------------------------------------------------
-    print("[1/5] Loading data …")
+    print("[1/6] Loading data …")
     train_df = pd.read_csv(args.train_path)
     with open(args.mapping_path) as fh:
         wr_mapping = json.load(fh)
@@ -168,8 +255,33 @@ def main():
     if args.test_path and os.path.exists(args.test_path):
         test_df = pd.read_csv(args.test_path)
 
+    # ---- optional data transfer -------------------------------------------
+    if test_df is not None and args.transfer_ratio > 0:
+        print("[1.5/6] Transferring test orders into training set …")
+        train_df, test_df, t_ids, r_ids = transfer_test_orders(
+            train_df, test_df, ratio=args.transfer_ratio, seed=args.seed,
+            exclude_original=args.exclude_original,
+        )
+        print(f"  Transferred {len(t_ids)} orders → train "
+              f"({len(train_df)} rows)")
+        print(f"  Remaining test: {len(r_ids)} orders "
+              f"({len(test_df)} rows)")
+        # Persist the new splits for reproducibility
+        aug_path = os.path.join(
+            os.path.dirname(args.train_path),
+            "训练集_特征_标签_augmented.csv",
+        )
+        rem_path = os.path.join(
+            os.path.dirname(args.test_path),
+            "测试集_特征_标签_remaining.csv",
+        )
+        train_df.to_csv(aug_path, index=False)
+        test_df.to_csv(rem_path, index=False)
+        print(f"  Saved → {aug_path}")
+        print(f"  Saved → {rem_path}")
+
     # ---- row-level features (for LightGBM) --------------------------------
-    print("[2/5] Building features …")
+    print("[2/6] Building features …")
     X_row_all = build_row_features(train_df, wr_mapping)
     y_all = train_df["soh"]
     row_feat_names = list(X_row_all.columns)
@@ -192,12 +304,13 @@ def main():
     X_ord_val_s = ord_scaler.transform(X_ord_val)
 
     # optional PCA on order-level features
-    pca = PCA(n_components=min(50, X_ord_tr_s.shape[1]), random_state=args.seed)
+    n_pca = min(50, X_ord_tr_s.shape[1], X_ord_tr_s.shape[0])
+    pca = PCA(n_components=n_pca, random_state=args.seed)
     X_ord_tr_pca = pca.fit_transform(X_ord_tr_s)
     X_ord_val_pca = pca.transform(X_ord_val_s)
 
     # ---- 1. LightGBM (row-level) -----------------------------------------
-    print("[3/5] Optimising LightGBM …")
+    print("[3/6] Optimising LightGBM …")
     lgb_study = optuna.create_study(direction="minimize")
     lgb_study.optimize(
         lambda t: _lgb_objective(t, X_row_tr, y_row_tr, X_row_val, y_row_val),
@@ -210,7 +323,7 @@ def main():
     print(f"  LGB val MAE = {lgb_study.best_value:.6f}")
 
     # ---- 2. MLP (order-level + PCA) --------------------------------------
-    print("[4/5] Optimising MLP & Ridge (order-level) …")
+    print("[4/6] Optimising MLP & Ridge (order-level) …")
     mlp_study = optuna.create_study(direction="minimize")
     mlp_study.optimize(
         lambda t: _mlp_objective(t, X_ord_tr_pca, y_ord_tr, X_ord_val_pca, y_ord_val),
@@ -225,15 +338,20 @@ def main():
     # Retrain on full data
     full_ord_scaler = StandardScaler()
     X_ord_all_s = full_ord_scaler.fit_transform(X_ord)
-    full_pca = PCA(n_components=min(50, X_ord_all_s.shape[1]),
+    n_pca_full = min(50, X_ord_all_s.shape[1], X_ord_all_s.shape[0])
+    full_pca = PCA(n_components=n_pca_full,
                    random_state=args.seed)
     X_ord_all_pca = full_pca.fit_transform(X_ord_all_s)
 
+    # For small datasets, disable early_stopping (needs validation split)
+    use_early_stop = len(y_ord) >= 20
     mlp_model = MLPRegressor(
         hidden_layer_sizes=layers, max_iter=3000, alpha=best_alpha,
         learning_rate_init=best_lr, learning_rate="adaptive",
-        random_state=42, early_stopping=True, validation_fraction=0.15,
-        n_iter_no_change=30,
+        random_state=42,
+        early_stopping=use_early_stop,
+        validation_fraction=0.15 if use_early_stop else 0.0,
+        n_iter_no_change=30 if use_early_stop else 10,
     )
     mlp_model.fit(X_ord_all_pca, y_ord)
     print(f"  MLP val MAE = {mlp_study.best_value:.6f}")
@@ -249,7 +367,7 @@ def main():
     print(f"  Ridge val MAE = {ridge_study.best_value:.6f}")
 
     # ---- ensemble weights (optimised on order-level val split) -----------
-    print("[5/5] Optimising ensemble weights …")
+    print("[5/6] Optimising ensemble weights …")
     # Rebuild per-order validation predictions
     val_ids = set(
         train_df.loc[X_row_val.index, "order_id"].unique()
@@ -296,6 +414,7 @@ def main():
     print(f"  Weights: {weights}")
 
     # ---- save -------------------------------------------------------------
+    print("[6/6] Saving model artifacts …")
     artifacts = {
         "lgb_model": lgb_model,
         "mlp_model": mlp_model,
@@ -331,13 +450,15 @@ def _evaluate_test(test_df, arts):
     ord_feat = arts["ord_feat_names"]
     w = arts["weights"]
 
+    label_col = "soh" if "soh" in test_df.columns else "y_t"
+
     X_test_row = build_row_features(test_df, wr_mapping)
     pred_lgb = lgb_model.predict(X_test_row)
 
     test_copy = test_df.copy()
     test_copy["pred_lgb"] = pred_lgb
     lgb_ord = test_copy.groupby("order_id").agg(
-        y_t=("y_t", "first"), pred_lgb=("pred_lgb", "mean"),
+        label=(label_col, "first"), pred_lgb=("pred_lgb", "mean"),
     ).reset_index()
 
     ord_test = build_order_features(test_df, wr_mapping)
@@ -365,7 +486,7 @@ def _evaluate_test(test_df, arts):
     ) / ws
 
     for col in ["pred_lgb", "pred_mlp", "pred_ridge", "pred_ens"]:
-        mae = mean_absolute_error(final["y_t"], final[col])
+        mae = mean_absolute_error(final["label"], final[col])
         print(f"  {col:15s} order-MAE = {mae:.6f}")
 
     # row-level ensemble
@@ -376,7 +497,7 @@ def _evaluate_test(test_df, arts):
         + w["w_mlp"] * test_copy["pred_mlp"]
         + w["w_ridge"] * test_copy["pred_ridge"]
     ) / ws
-    row_mae = mean_absolute_error(test_copy["y_t"], test_copy["pred_ens"])
+    row_mae = mean_absolute_error(test_copy[label_col], test_copy["pred_ens"])
     print(f"\n  Row-level ensemble MAE = {row_mae:.6f}")
 
 
